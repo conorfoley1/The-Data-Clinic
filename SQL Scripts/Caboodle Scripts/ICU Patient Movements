@@ -1,0 +1,129 @@
+----------------------------------------
+--Name:ICU Patient Movemoents
+--Description: The script is used to identify patients movments around the Trust and for our purpuses it has filtered down (on line 91) to those movements involving ICU wards.
+--Data Source: CABOODLE_REPORT
+---------------------------------------
+
+drop table if exists #movements
+select pat.PrimaryMrn
+,cast(haf.EncounterEpicCsn as varchar) as  EncounterEpicCsn
+,plef.EncounterKey
+,plef.PatientLocationEventKey
+,plef.CensusLocationKey
+,cen.LocationAbbreviation as 'CensusSite'
+,cen.DepartmentAbbreviation as 'CensusDepartment'
+,cen.RoomName as 'CensusRoom'
+,cen.BedName as 'CensusBed'
+,cen.BedInCensus
+,plef.EventType
+,plef.EventLengthInMinutes
+,plef.StartInstant
+,plef.EndInstant
+,ROW_NUMBER() over(partition by plef.EncounterKey order by plef.StartInstant) as 'Allorder'
+,ROW_NUMBER() over(partition by plef.EncounterKey,cen.DepartmentAbbreviation order by plef.StartInstant) as 'Wardorder'
+,ROW_NUMBER() over(partition by plef.EncounterKey,cen.DepartmentAbbreviation,cen.RoomName order by plef.StartInstant) as 'Roomorder'
+,ROW_NUMBER() over(partition by plef.EncounterKey,cen.DepartmentAbbreviation,cen.RoomName,cen.BedName order by plef.StartInstant) as 'Bedorder'
+,ROW_NUMBER() over(partition by plef.EncounterKey order by plef.StartInstant) - ROW_NUMBER() over(partition by plef.EncounterKey,cen.DepartmentAbbreviation order by plef.StartInstant) as 'WardGrouping'
+,ROW_NUMBER() over(partition by plef.EncounterKey order by plef.StartInstant) - ROW_NUMBER() over(partition by plef.EncounterKey,cen.DepartmentAbbreviation,cen.RoomName,cen.BedName order by plef.StartInstant) as 'RoomGrouping'
+,ROW_NUMBER() over(partition by plef.EncounterKey order by plef.StartInstant) - ROW_NUMBER() over(partition by plef.EncounterKey,cen.DepartmentAbbreviation,cen.RoomName,cen.BedName order by plef.StartInstant) as 'BedGrouping'
+into #movements
+from PatientLocationEventFact plef
+	
+inner join HospitalAdmissionFact haf on plef.EncounterKey = haf.EncounterKey
+inner join PatientDim pat on plef.PatientKey = pat.PatientKey
+inner join DepartmentDim cen on plef.CensusLocationKey = cen.DepartmentKey and cen.IsBed = 1 
+	
+order by haf.EncounterEpicCsn, plef.StartInstant
+
+drop table if exists #wardtransfers
+	;with wards as (
+	select 
+	EncounterEpicCsn
+	,EncounterKey
+	,CensusSite as 'Site'
+	,CensusDepartment as 'Department'
+	,min(StartInstant) as 'TransferStartDate'
+	,case when max(case when EndInstant is null then 1 else 0 end) = 0 then max(EndInstant) end as 'TransferEndDate'
+	,ROW_NUMBER() over(partition by encounterkey order by min(startInstant)) as 'TransferNumber'
+	from #movements
+	
+	group by EncounterEpicCsn
+	,Encounterkey
+	,CensusSite
+	,CensusDepartment
+	,WardGrouping
+	)
+	select 
+	wt.EncounterEpicCsn
+	,wt.EncounterKey
+	,wt.Site
+	,wt.Department
+	,sp.AdmissionDate
+	,sp.DischargeDate
+	,wt.TransferStartDate
+	,wt.TransferEndDate
+	,wt.TransferNumber
+	,wtp.Site as 'SiteTransferredFrom'
+	,wtp.Department as 'DepartmentTransferredFrom'
+	,wtn.Site as 'SiteTransferredTo'
+	,wtn.Department as 'DepartmentTransferredTo'
+	,case 
+		when wt.Department ='UCH ED' then 'AE'
+		when CAST(FORMAT(wt.TransferStartDate,'yyyy-MM-dd HH:mm') AS datetime) = CAST(FORMAT(sp.AdmissionDate,'yyyy-MM-dd HH:mm') AS datetime) then 'A'
+		when CAST(FORMAT(wt.TransferStartDate,'yyyy-MM-dd HH:mm') AS datetime) = CAST(FORMAT(sp.AdmissionDate,'yyyy-MM-dd HH:mm') AS datetime) then 'A'
+		else'T'
+		end as 'TransferTypeStart'
+	,case 
+		when CAST(FORMAT(wt.TransferEndDate,'yyyy-MM-dd HH:mm') AS datetime) = CAST(FORMAT(sp.DischargeDate,'yyyy-MM-dd HH:mm') AS datetime) then 'D'
+		when wtn.Department ='UCH ED' then 'AE'
+		when CAST(FORMAT(wt.TransferEndDate,'yyyy-MM-dd HH:mm') AS datetime) = CAST(FORMAT(sp.AdmissionDate,'yyyy-MM-dd HH:mm') AS datetime) then 'A'
+		when CAST(FORMAT(wt.TransferEndDate,'yyyy-MM-dd HH:mm') AS datetime) = CAST(FORMAT(sp.AdmissionDate,'yyyy-MM-dd HH:mm') AS datetime) then 'A'
+		when wt.Department ='UCH ED' and wtn.EncounterEpicCsn is null and wt.TransferEndDate is not null then 'D'
+		when wt.TransferEndDate is null then null
+		else 'T'
+		end as 'TransferTypeEnd'
+	into #wardtransfers
+	from wards wt
+	
+	left join wards wtp on wt.EncounterKey = wtp.EncounterKey and wtp.TransferNumber = wt.TransferNumber - 1
+	left join wards wtn on wt.EncounterKey = wtn.EncounterKey and wtn.TransferNumber = wt.TransferNumber + 1
+	left join cas.IP_Spell sp on wt.EncounterEpicCsn = sp.HospitalProviderSpellNumber
+	where wt.Department IN ('UCH T03 ICU','WMS CCU','GWB L01W'
+	                                        ,'UCH P03 CV','UCH T07 CV','UCH T06 PACU')
+	order by wt.EncounterEpicCsn, wt.TransferNumber
+
+DROP TABLE IF EXISTS #cohort
+select 
+wt.EncounterEpicCsn
+,wt.EncounterKey
+,wt.Department
+,convert(varchar(8),wt.TransferStartDate,112) as 'TransferStartDateKey'
+,replace(left(cast(wt.TransferStartDate as time),5),':','') as 'TransferStartTimeKey'
+,convert(varchar(8),wt.TransferEndDate,112) as 'TransferEndDateKey'
+,replace(left(cast(wt.TransferEndDate as time),5),':','') as 'TransferEndTimeKey'
+,wt.TransferStartDate
+,wt.TransferEndDate
+,wt.TransferTypeStart
+,wt.TransferTypeEnd
+,wt.DepartmentTransferredFrom
+,wt.DepartmentTransferredTo
+,datediff(day,wt.TransferStartDate,wt.TransferEndDate)as 'Meas_LoS_Days'
+,datediff(hour,wt.TransferStartDate,wt.TransferEndDate)as 'Meas_LoS_Hrs'
+,case when wt.TransferTypeStart = 'A' then 1 end as 'Meas_Admissions'
+,case when wt.TransferTypeStart = 'T' then 1 end as 'Meas_TransferIn'
+,case when wt.TransferTypeEnd = 'D' then 1 end as 'Meas_Discharges'
+,case when wt.TransferTypeEnd = 'T' then 1 end as 'Meas_TransferOut'
+,case 
+	when wt.TransferTypeEnd = 'D' and sp.DischargeMethodCode = 4 
+	then 1
+	when wt.TransferEndDate <= GETDATE()
+	then 0
+	end as 'Meas_Death'
+,1 as 'Meas_Pts'
+INTO #cohort
+from #wardtransfers wt
+
+left join cas.IP_Spell sp on wt.EncounterEpicCsn = sp.HospitalProviderSpellNumber
+
+SELECT *
+FROM #cohort
